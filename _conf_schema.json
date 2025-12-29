@@ -1,0 +1,30 @@
+{"enabled": {"description": "是否启用LLM指令执行器",
+        "type": "bool",
+        "default": true,
+        "hint": "启用后，LLM可以通过execute_command工具代理执行Bot指令"
+    },
+    "whitelist": {
+        "description": "允许执行的指令白名单",
+        "type": "list",
+        "default": [],
+        "hint": "留空表示允许所有指令。填写指令名（不含前缀），如：[\"钓鱼\", \"签到\", \"背包\"]"
+    },
+    "blacklist": {
+        "description": "禁止执行的指令黑名单",
+        "type": "list",
+        "default": [],
+        "hint": "在此列表中的指令将被禁止执行。填写指令名（不含前缀），如：[\"转账\", \"购买\"]"
+    },
+    "allow_admin_commands": {
+        "description": "是否允许执行管理员指令",
+        "type": "bool",
+        "default": false,
+        "hint": "警告：启用此选项可能存在安全风险！建议保持关闭"
+    },
+    "admin_users": {
+        "description": "管理员用户列表，这些用户可以通过 LLM 执行管理员指令（填写用户ID）",
+        "type": "list",
+        "default": [],
+        "hint": "在此列表中的用户可以执行管理员指令，无需开启 allow_admin_commands"
+    }
+}
