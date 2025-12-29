@@ -1,5 +1,6 @@
 name: astrbot_plugin_llm_executor
+display_name: 指令执行器
 version: 1.0.0
 author: gabriel0721
-description: 让LLM代理执行Bot指令，配合command_query插件使用，实现自然语言到指令的转换
+desc: 让LLM代理执行Bot指令，配合command_query插件使用，实现自然语言到指令的转换
 repo: https://github.com/TenmaGabriel0721/astrbot_plugin_llm_executor.git
