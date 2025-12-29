@@ -63,7 +63,7 @@ class LLMExecutorPlugin(Star):
         logger.info(f"已缓存 {len(self._handler_cache)} 个指令处理器")
 
     def _build_handler_cache(self):
-        """构建指令名到处理器的映射"""
+        """构建指令名到处理器的映射 - 优化版 O(N+M)"""
         self._handler_cache.clear()
         self._alias_to_command.clear()
         
@@ -79,76 +79,82 @@ class LLMExecutorPlugin(Star):
             logger.warning("没有找到任何激活的插件")
             return
         
-        # 遍历所有插件
+        # 跳过的插件列表
+        skip_plugins = {
+            "astrbot",
+            "astrbot_plugin_llm_executor",
+            "astrbot_plugin_command_query",
+            "astrbot-reminder"
+        }
+        
+        # === 优化关键: O(N) - 预构建 module_path -> (star, plugin_name) 的索引 ===
+        module_to_star = {}
         for star in all_stars:
             plugin_name = getattr(star, "name", "未知插件")
             module_path = getattr(star, "module_path", None)
             
             # 跳过核心插件和自身
-            skip_plugins = [
-                "astrbot", 
-                "astrbot_plugin_llm_executor", 
-                "astrbot_plugin_command_query",
-                "astrbot-reminder"
-            ]
-            if plugin_name in skip_plugins:
+            if plugin_name in skip_plugins or not module_path:
                 continue
             
-            if not module_path:
+            module_to_star[module_path] = (star, plugin_name)
+        
+        # === O(M) - 只遍历一次处理器注册表，使用 O(1) 字典查找 ===
+        for handler in star_handlers_registry:
+            if not isinstance(handler, StarHandlerMetadata):
                 continue
-            # 遍历所有注册的处理器
-            for handler in star_handlers_registry:
-                if not isinstance(handler, StarHandlerMetadata):
-                    continue
+            
+            # O(1) 哈希查找，替代原来的 O(N) 内层循环
+            star_info = module_to_star.get(handler.handler_module_path)
+            if not star_info:
+                continue
+            
+            star, plugin_name = star_info
+            
+            command_name = None
+            aliases = []
+            description = handler.desc or "无描述"
+            is_admin_command = False
+            
+            # 查找命令过滤器和权限过滤器
+            for filter_ in handler.event_filters:
+                if isinstance(filter_, CommandFilter):
+                    command_name = filter_.command_name
+                    # 获取别名
+                    if hasattr(filter_, 'alias') and filter_.alias:
+                        if isinstance(filter_.alias, set):
+                            aliases = list(filter_.alias)
+                        elif isinstance(filter_.alias, list):
+                            aliases = filter_.alias
+                elif isinstance(filter_, CommandGroupFilter):
+                    command_name = filter_.group_name
+                elif isinstance(filter_, PermissionTypeFilter):
+                    # 检查是否是管理员指令
+                    is_admin_command = True
+            
+            # 如果找到了命令，添加到缓存
+            if command_name:
+                # 标准化命令名（不带前缀）
+                if command_name.startswith("/"):
+                    command_name = command_name[1:]
                 
-                # 检查此处理器是否属于当前插件
-                if handler.handler_module_path != module_path:
-                    continue
+                handler_info = {
+                    "command": command_name,
+                    "description": description,
+                    "plugin": plugin_name,
+                    "aliases": aliases,
+                    "is_admin": is_admin_command,
+                    "handler": handler,
+                    "module_path": handler.handler_module_path
+                }
                 
-                command_name = None
-                aliases = []
-                description = handler.desc or "无描述"
-                is_admin_command = False
+                self._handler_cache[command_name] = handler_info
                 
-                # 查找命令过滤器和权限过滤器
-                for filter_ in handler.event_filters:
-                    if isinstance(filter_, CommandFilter):
-                        command_name = filter_.command_name
-                        # 获取别名
-                        if hasattr(filter_, 'alias') and filter_.alias:
-                            if isinstance(filter_.alias, set):
-                                aliases = list(filter_.alias)
-                            elif isinstance(filter_.alias, list):
-                                aliases = filter_.alias
-                    elif isinstance(filter_, CommandGroupFilter):
-                        command_name = filter_.group_name
-                    elif isinstance(filter_, PermissionTypeFilter):
-                        # 检查是否是管理员指令
-                        is_admin_command = True
-                
-                # 如果找到了命令，添加到缓存
-                if command_name:
-                    # 标准化命令名（不带前缀）
-                    if command_name.startswith("/"):
-                        command_name = command_name[1:]
-                    
-                    handler_info = {
-                        "command": command_name,
-                        "description": description,
-                        "plugin": plugin_name,
-                        "aliases": aliases,
-                        "is_admin": is_admin_command,
-                        "handler": handler,
-                        "module_path": module_path
-                    }
-                    
-                    self._handler_cache[command_name] = handler_info
-                    
-                    # 为别名建立索引
-                    for alias in aliases:
-                        if alias.startswith("/"):
-                            alias = alias[1:]
-                        self._alias_to_command[alias] = command_name
+                # 为别名建立索引
+                for alias in aliases:
+                    if alias.startswith("/"):
+                        alias = alias[1:]
+                    self._alias_to_command[alias] = command_name
 
     def _can_execute(self, command: str, event: AstrMessageEvent) -> tuple[bool, str]:
         """
