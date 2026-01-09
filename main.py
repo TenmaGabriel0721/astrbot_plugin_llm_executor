@@ -323,7 +323,13 @@ class LLMExecutorPlugin(Star):
         # 如果有图片引用，添加 Reply 组件（包含图片）
         if reply_image_url:
             # 创建一个虚拟的 Reply 对象，包含图片
-            reply_chain = [Image(url=reply_image_url)]
+            # Image.fromURL() 是正确的构造方式，避免缺少 file 参数
+            try:
+                img_comp = Image.fromURL(reply_image_url)
+            except (AttributeError, TypeError):
+                # 回退：直接使用 file 参数传递 URL
+                img_comp = Image(file=reply_image_url)
+            reply_chain = [img_comp]
             reply_comp = Reply(id=0, sender_id=0, chain=reply_chain)
             components.append(reply_comp)
         
