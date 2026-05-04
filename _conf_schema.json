@@ -46,5 +46,29 @@
         "type": "int",
         "default": 1500,
         "hint": "当指令输出的文本字数超过此值时，将使用合并转发。建议值：1000-2000"
+    },
+    "at_position_mode": {
+        "description": "@用户默认插入位置",
+        "type": "string",
+        "default": "before_args",
+        "hint": "控制未使用 @0 占位符时，@用户默认放在参数前还是参数后。before_args 表示 /命令 @用户 参数，after_args 表示 /命令 参数 @用户"
+    },
+    "command_at_position_map": {
+        "description": "按指令覆盖 @用户插入位置",
+        "type": "object",
+        "items": {
+            "禁言": {
+                "type": "string",
+                "default": "after_args",
+                "hint": "示例：禁言通常可设为 after_args，表示 /禁言 10秒 @用户"
+            },
+            "转账": {
+                "type": "string",
+                "default": "before_args",
+                "hint": "示例：转账通常可设为 before_args，表示 /转账 @用户 1000"
+            }
+        },
+        "default": {},
+        "hint": "按指令名分别指定 @ 位置策略。可选值：before_args 或 after_args。未指定的指令会回退到 at_position_mode"
     }
 }

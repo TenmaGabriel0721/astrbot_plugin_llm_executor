@@ -78,8 +78,6 @@ class LLMExecutorPlugin(Star):
         self.bot_user_id = self.config.get("bot_user_id", "bot_self")
         self.enable_forward = self.config.get("enable_forward", True)
         self.forward_threshold = self.config.get("forward_threshold", 1500)
-        self.at_position_mode = self.config.get("at_position_mode", "before_args")
-        self.command_at_position_map: Dict[str, str] = self.config.get("command_at_position_map", {})
         
         logger.info(f"LLM指令执行器插件已加载 v1.1")
         logger.info(f"  - 启用状态: {self.enabled}")
@@ -262,12 +260,6 @@ class LLMExecutorPlugin(Star):
             logger.error(f"获取插件实例失败: {e}")
             return None
 
-    def _resolve_at_position_mode(self, command: str) -> str:
-        """解析指定指令的 @ 默认位置策略。"""
-        command = (command or "").lstrip("/")
-        mode = self.command_at_position_map.get(command, self.at_position_mode)
-        return mode if mode in ("before_args", "after_args") else "before_args"
-
     def _extract_content_from_result(self, result: Any) -> Dict[str, Any]:
         """
         从执行结果中提取内容（文本和图片）
@@ -380,27 +372,14 @@ class LLMExecutorPlugin(Star):
                 if text_buffer:
                     components.append(Plain(text=" " + " ".join(text_buffer)))
             else:
-                # 模式2: 默认模式 - 由配置决定 @ 组件在参数前还是参数后
-                # before_args: /命令 @用户 参数
-                # after_args:  /命令 参数 @用户
-                components.append(Plain(text=f"/{command}"))
-                at_position_mode = self._resolve_at_position_mode(command)
-                if at_position_mode == "after_args":
-                    if args:
-                        components.append(Plain(text=f" {args}"))
-                    for qq in at_qq_list:
-                        try:
-                            components.append(At(qq=str(qq)))
-                        except Exception as e:
-                            logger.warning(f"添加 At 组件失败 (QQ: {qq}): {e}")
-                else:
-                    for qq in at_qq_list:
-                        try:
-                            components.append(At(qq=str(qq)))
-                        except Exception as e:
-                            logger.warning(f"添加 At 组件失败 (QQ: {qq}): {e}")
-                    if args:
-                        components.append(Plain(text=f" {args}"))
+                # 模式2: 传统模式 - 先拼好指令+参数文本，再追加所有 @ 组件（兼容：禁言 60 @user 这种）
+                cmd_text = f"/{command}" + (f" {args}" if args else "")
+                components.append(Plain(text=cmd_text))
+                for qq in at_qq_list:
+                    try:
+                        components.append(At(qq=str(qq)))
+                    except Exception as e:
+                        logger.warning(f"添加 At 组件失败 (QQ: {qq}): {e}")
         else:
             # 没有 @ 或没有参数，简单构建
             command_text = f"/{command}"
@@ -685,30 +664,11 @@ class LLMExecutorPlugin(Star):
                 logger.debug(f"已创建Bot身份包装器，原始ID: {original_sender_id}, Bot ID: {self.bot_user_id}")
             
             # 修改 event.message_str 以包含指令和参数
-            # 注意：部分下游插件直接解析 message_str（而不是 message_obj），
-            # 因此当存在 @ 参数时，也需要把 @ 信息同步到 message_str 中。
-            if at_qq_list:
-                rendered_args = args or ""
-                has_placeholders = any(f"@{i}" in rendered_args for i in range(len(at_qq_list)))
-                if has_placeholders:
-                    for i, qq in enumerate(at_qq_list):
-                        rendered_args = rendered_args.replace(f"@{i}", f"@{qq}")
-                    event.message_str = f"/{actual_command}" + (f" {rendered_args}" if rendered_args else "")
-                else:
-                    at_text = " ".join(f"@{qq}" for qq in at_qq_list)
-                    at_position_mode = self._resolve_at_position_mode(actual_command)
-                    if at_position_mode == "after_args":
-                        if args:
-                            event.message_str = f"/{actual_command} {args} {at_text}"
-                        else:
-                            event.message_str = f"/{actual_command} {at_text}"
-                    else:
-                        if args:
-                            event.message_str = f"/{actual_command} {at_text} {args}"
-                        else:
-                            event.message_str = f"/{actual_command} {at_text}"
+            # 使用 / 作为标准前缀
+            if args:
+                event.message_str = f"/{actual_command} {args}"
             else:
-                event.message_str = f"/{actual_command}" + (f" {args}" if args else "")
+                event.message_str = f"/{actual_command}"
             
             # 如果有特殊参数，构建 message_obj
             if at_qq_list or reply_image_url:
