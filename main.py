@@ -1,6 +1,7 @@
 import json
 import inspect
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
@@ -268,6 +269,36 @@ class LLMExecutorPlugin(Star):
         mode = self.command_at_position_map.get(command, self.at_position_mode)
         return mode if mode in ("before_args", "after_args") else "before_args"
 
+    def _normalize_image_output(self, image_value: Any) -> str:
+        """将图片输出归一化为可回传给上游的稳定地址格式"""
+        if image_value is None:
+            return ""
+
+        image_str = str(image_value).strip()
+        if not image_str:
+            return ""
+
+        lower_str = image_str.lower()
+        if lower_str.startswith(("http://", "https://", "data:")):
+            return image_str
+
+        if lower_str.startswith("file://"):
+            try:
+                raw_path = image_str[7:]
+                while raw_path.startswith("/") and len(raw_path) > 2 and raw_path[2] == ':':
+                    raw_path = raw_path[1:]
+                file_uri = Path(raw_path.replace("/", "\\")).resolve().as_uri()
+                return file_uri
+            except Exception as e:
+                logger.debug(f"规范化 file URI 失败，保留原值: {e}")
+                return image_str.replace("\\", "/")
+
+        try:
+            return Path(image_str).resolve().as_uri()
+        except Exception as e:
+            logger.debug(f"规范化本地图片路径失败，保留原值: {e}")
+            return image_str.replace("\\", "/")
+
     def _extract_content_from_result(self, result: Any) -> Dict[str, Any]:
         """
         从执行结果中提取内容（文本和图片）
@@ -295,9 +326,13 @@ class LLMExecutorPlugin(Star):
                     # 处理 Image 类型
                     elif isinstance(comp, Image) or (hasattr(comp, 'type') and comp.type == 'Image'):
                         if hasattr(comp, 'url') and comp.url:
-                            images.append(str(comp.url))
+                            normalized = self._normalize_image_output(comp.url)
+                            if normalized:
+                                images.append(normalized)
                         elif hasattr(comp, 'file') and comp.file:
-                            images.append(str(comp.file))
+                            normalized = self._normalize_image_output(comp.file)
+                            if normalized:
+                                images.append(normalized)
             # 处理字符串结果
             elif isinstance(result, str):
                 texts.append(result)
@@ -332,8 +367,20 @@ class LLMExecutorPlugin(Star):
         
         # 如果有图片引用，添加 Reply 组件（包含图片）
         if reply_image_url:
-            # 创建一个虚拟的 Reply 对象，包含图片
-            reply_chain = [Image(url=reply_image_url)]
+            # reply_image_url 实际上可能是远程 URL，也可能是本地临时文件路径
+            image_source = str(reply_image_url).strip()
+            try:
+                if image_source.startswith(("http://", "https://")):
+                    img_comp = Image.fromURL(image_source)
+                else:
+                    img_comp = Image(file=image_source)
+            except Exception as e:
+                logger.warning(f"按首选方式构建图片组件失败，尝试回退: {e}")
+                try:
+                    img_comp = Image(file=image_source)
+                except Exception:
+                    img_comp = Image.fromURL(image_source)
+            reply_chain = [img_comp]
             reply_comp = Reply(id=0, sender_id=0, chain=reply_chain)
             components.append(reply_comp)
         
