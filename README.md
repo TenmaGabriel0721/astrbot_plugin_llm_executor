@@ -1,14 +1,15 @@
 # AstrBot LLM 指令执行器插件
 
-让 LLM 能够代理执行 Bot 指令，实现自然语言到指令的转换。
+让 LLM 能够代理用户或以 Bot 自身身份执行 AstrBot 指令，实现自然语言到指令的转换，并通过 AstrBot 原生过滤器和权限策略控制管理员指令。
 
 ## 功能特性
 
 - 🎮 **指令代理执行**：LLM 可以通过 `execute_command` 工具执行 Bot 指令
 - 🤖 **Bot 自身执行**：Bot 可以以自己的身份执行指令，拥有独立的游戏账户
 - 📋 **指令列表查询**：LLM 可以通过 `list_executable_commands` 工具获取可执行的指令列表
-- 🔒 **安全控制**：支持白名单、黑名单和管理员指令权限控制
+- 🔒 **安全控制**：支持白名单、黑名单、管理员指令权限控制和 AstrBot 原生过滤器校验
 - 👤 **管理员用户列表**：支持配置特定用户执行管理员指令
+- 🛡️ **Bot 管理员身份**：当 `bot_user_id` 是 AstrBot 框架管理员时，可在 `as_bot=true` 下以 Bot 身份执行低风险管理员指令
 - 🔄 **自动缓存**：自动缓存指令处理器，提高执行效率
 
 ## 设计理念
@@ -35,9 +36,12 @@
 **参数：**
 - `command` (string, 必需): 要执行的指令名（不含前缀），如 "钓鱼"、"签到"、"背包"
 - `args` (string, 可选): 指令参数，多个参数用空格分隔
+- `at_qq_list` (array[string], 可选): 需要 @ 的目标用户 QQ 号列表
+- `reply_image_url` (string, 可选): 需要引用图片时传入图片地址
 - `as_bot` (boolean, 可选): 是否以 Bot 自己的身份执行指令（默认 false）
   - `false`（默认）：代理用户执行，使用用户的身份和账户
   - `true`：Bot 自己执行，使用 Bot 自己的身份和账户
+  - 管理员指令只有在 `bot_user_id` 已加入 AstrBot 框架 `admins_id`，且请求可信、明确、低风险时才建议使用 `true`
 
 **返回：**
 JSON 格式的执行结果，包含 `success`、`command`、`result`、`executed_as` 或 `error` 字段
@@ -79,6 +83,10 @@ JSON 格式的可执行指令列表，按插件分组
 | `allow_admin_commands` | bool | false | 是否允许所有用户执行管理员指令 |
 | `admin_users` | list | [] | 管理员用户列表，这些用户可以执行管理员指令 |
 | `bot_user_id` | string | "bot_self" | Bot 自己的用户 ID，用于 as_bot=true 时的身份标识 |
+| `enable_forward` | bool | true | 长文本结果是否自动使用合并转发 |
+| `forward_threshold` | int | 1500 | 触发合并转发的文本长度阈值 |
+| `at_position_mode` | string | "before_args" | 未使用 @ 占位符时，@ 用户默认放在参数前还是参数后 |
+| `command_at_position_map` | object | {} | 按指令覆盖 @ 用户插入位置 |
 
 ### 配置示例
 
@@ -147,16 +155,22 @@ JSON 格式的可执行指令列表，按插件分组
 
 管理员指令的执行权限检查逻辑如下：
 
-1. 如果指令不是管理员指令，直接允许执行
+1. 如果指令不是管理员指令，按用户意图正常执行
 2. 如果指令是管理员指令：
-   - 首先检查用户 ID 是否在 `admin_users` 列表中，如果在则允许执行
-   - 如果不在 `admin_users` 列表中，检查 `allow_admin_commands` 配置
-   - 如果 `allow_admin_commands` 为 true，允许执行
-   - 否则拒绝执行
+   - 用户 ID 在 `admin_users` 列表中时允许执行
+   - `allow_admin_commands=true` 时允许所有用户执行（不推荐）
+   - 当 `as_bot=true` 且 `bot_user_id` 已加入 AstrBot 框架 `admins_id` 时，允许以 Bot 自身管理员身份执行
+   - 其他情况拒绝执行
+
+建议的 LLM 行为：
+- 普通非管理员指令无需额外限制，默认代理用户，明确要求 Bot 自己参与时使用 `as_bot=true`
+- 管理员指令需要确认用户可信、目标明确、参数明确且操作低风险后再执行
+- 重启、关闭、停止、更新、重载、删除、清空、重置、权限变更、群发、广播、@全体等高影响管理员指令默认不要自动执行
 
 这意味着：
 - `admin_users` 列表中的用户可以执行管理员指令，无需开启 `allow_admin_commands`
 - `allow_admin_commands` 是全局开关，开启后所有用户都可以执行管理员指令（不推荐）
+- 如果希望 Bot 以自己的管理员身份执行低风险管理员指令，需要同时设置插件的 `bot_user_id`，并把同一个 ID 加入 AstrBot 主配置的 `admins_id`
 
 ## 用户指令
 
@@ -168,10 +182,11 @@ JSON 格式的可执行指令列表，按插件分组
 ## 安全注意事项
 
 ⚠️ **警告**：
-- 默认情况下，管理员指令（如修改金币、奖励道具等）不允许通过 LLM 执行
-- 推荐使用 `admin_users` 配置特定用户的管理员权限，而不是开启 `allow_admin_commands`
-- 如果启用 `allow_admin_commands`，请确保您了解潜在的安全风险
-- 建议使用白名单模式，只允许执行安全的指令
+- 推荐优先使用 `admin_users` 或 Bot 框架管理员身份控制管理员指令，不推荐开启 `allow_admin_commands`
+- `allow_admin_commands` 会让所有用户都可以执行管理员指令，请确保您了解潜在风险
+- 即使 Bot 可以以框架管理员身份执行指令，也应在 LLM 人格或工具描述中限制高影响管理员操作
+- 重启、关闭、删除、清空、重置、权限变更、群发、广播、@全体等操作建议始终人工确认
+- 建议根据实际场景配置黑名单或白名单，降低误调用风险
 
 ## 依赖
 
@@ -183,6 +198,12 @@ JSON 格式的可执行指令列表，按插件分组
 珈百璃
 
 ## 版本历史
+
+### v1.2.0
+- ✨ 支持 `as_bot=true` 且 `bot_user_id` 是 AstrBot 框架管理员时，以 Bot 自身管理员身份执行管理员指令
+- ✅ 执行目标指令前复用 AstrBot 原生过滤器和参数解析
+- 🛡️ 增强事件状态恢复，避免执行失败后污染原事件
+- 📝 更新工具描述和安全说明，补充高影响管理员指令默认不自动执行
 
 ### v1.1.0
 - ✨ 新增 `as_bot` 参数，支持 Bot 以自己的身份执行指令

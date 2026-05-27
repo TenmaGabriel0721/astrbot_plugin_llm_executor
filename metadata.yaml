@@ -1,5 +1,5 @@
 name: astrbot_plugin_llm_executor
-version: 1.1.0
+version: 1.2.0
 author: 珈百璃
-description: 让LLM代理执行Bot指令或以Bot自身执行，配合command_query插件使用，实现自然语言到指令的转换。支持Bot作为独立个体参与游戏！
-repo: https://github.com/your-repo/astrbot_plugin_llm_executor
+description: 让LLM代理用户或以Bot自身身份执行AstrBot指令，支持原生过滤器校验、Bot框架管理员身份执行管理员指令和高影响操作安全约束。
+repo: https://github.com/TenmaGabriel0721/astrbot_plugin_llm_executor

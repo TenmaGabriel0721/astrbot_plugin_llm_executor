@@ -1,6 +1,7 @@
 import json
 import inspect
 import re
+import copy
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
@@ -8,9 +9,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
-from astrbot.core.star.filter.permission import PermissionTypeFilter
+from astrbot.core.star.filter.permission import PermissionTypeFilter, PermissionType
 from astrbot.core.star.star_handler import star_handlers_registry, StarHandlerMetadata
 from astrbot.core.message.components import At, Plain, Image, Reply, Node, Nodes
+from astrbot.core.pipeline.context_utils import call_handler
 
 
 class BotIdentityEventWrapper:
@@ -41,11 +43,11 @@ class BotIdentityEventWrapper:
     "astrbot_plugin_llm_executor",
     "珈百璃",
     "让LLM代理执行Bot指令或以Bot自身执行，配合command_query插件使用",
-    "1.1.0"
+    "1.2.0"
 )
 class LLMExecutorPlugin(Star):
     """
-    AstrBot LLM 指令执行器插件 v1.1
+    AstrBot LLM 指令执行器插件 v1.2
     
     【核心功能】
     让 LLM 能够代理执行普通插件指令，或以 Bot 自身执行指令，实现自然语言到指令的转换。
@@ -82,7 +84,7 @@ class LLMExecutorPlugin(Star):
         self.at_position_mode = self.config.get("at_position_mode", "before_args")
         self.command_at_position_map: Dict[str, str] = self.config.get("command_at_position_map", {})
         
-        logger.info(f"LLM指令执行器插件已加载 v1.1")
+        logger.info(f"LLM指令执行器插件已加载 v1.2")
         logger.info(f"  - 启用状态: {self.enabled}")
         logger.info(f"  - 白名单: {self.whitelist if self.whitelist else '无限制'}")
         logger.info(f"  - 黑名单: {self.blacklist if self.blacklist else '无'}")
@@ -153,24 +155,24 @@ class LLMExecutorPlugin(Star):
             # 查找命令过滤器和权限过滤器
             for filter_ in handler.event_filters:
                 if isinstance(filter_, CommandFilter):
-                    command_name = filter_.command_name
-                    # 获取别名
-                    if hasattr(filter_, 'alias') and filter_.alias:
-                        if isinstance(filter_.alias, set):
-                            aliases = list(filter_.alias)
-                        elif isinstance(filter_.alias, list):
-                            aliases = filter_.alias
+                    complete_names = filter_.get_complete_command_names()
+                    if complete_names:
+                        command_name = complete_names[0]
+                        aliases = complete_names[1:]
+                    else:
+                        command_name = filter_.command_name
+                        aliases = list(filter_.alias) if getattr(filter_, 'alias', None) else []
                 elif isinstance(filter_, CommandGroupFilter):
                     command_name = filter_.group_name
+                    aliases = list(filter_.alias) if getattr(filter_, 'alias', None) else []
                 elif isinstance(filter_, PermissionTypeFilter):
-                    # 检查是否是管理员指令
-                    is_admin_command = True
+                    is_admin_command = filter_.permission_type == PermissionType.ADMIN
             
             # 如果找到了命令，添加到缓存
             if command_name:
                 # 标准化命令名（不带前缀）
-                if command_name.startswith("/"):
-                    command_name = command_name[1:]
+                command_name = command_name.lstrip("/")
+                aliases = [alias.lstrip("/") for alias in aliases]
                 
                 handler_info = {
                     "command": command_name,
@@ -186,11 +188,9 @@ class LLMExecutorPlugin(Star):
                 
                 # 为别名建立索引
                 for alias in aliases:
-                    if alias.startswith("/"):
-                        alias = alias[1:]
                     self._alias_to_command[alias] = command_name
 
-    def _can_execute(self, command: str, event: AstrMessageEvent) -> tuple[bool, str]:
+    def _can_execute(self, command: str, event: AstrMessageEvent, as_bot: bool = False) -> tuple[bool, str]:
         """
         检查是否可以执行指令
         
@@ -236,7 +236,10 @@ class LLMExecutorPlugin(Star):
             # 检查是否在管理员用户列表中
             if user_id in self.admin_users:
                 return True, "可以执行（管理员用户）"
-            
+
+            if as_bot and self._is_bot_framework_admin():
+                return True, "可以执行（Bot框架管理员身份）"
+
             # 检查全局 allow_admin_commands 配置
             if not self.allow_admin_commands:
                 return False, f"指令 {command} 需要管理员权限，你不在管理员列表中"
@@ -268,6 +271,117 @@ class LLMExecutorPlugin(Star):
         command = (command or "").lstrip("/")
         mode = self.command_at_position_map.get(command, self.at_position_mode)
         return mode if mode in ("before_args", "after_args") else "before_args"
+
+    def _get_astrbot_config(self):
+        return getattr(self.context, "astrbot_config", None) or self.config
+
+    def _is_configured_admin(self, event: AstrMessageEvent) -> bool:
+        user_id = str(event.get_sender_id())
+        return user_id in self.admin_users or self.allow_admin_commands
+
+    def _is_bot_framework_admin(self) -> bool:
+        cfg = self._get_astrbot_config()
+        admins_id = cfg.get("admins_id", []) if hasattr(cfg, "get") else []
+        return str(self.bot_user_id) in {str(admin_id) for admin_id in admins_id}
+
+    def _snapshot_event_state(self, event: AstrMessageEvent) -> Dict[str, Any]:
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None) if message_obj else None
+        raw_message = getattr(message_obj, "raw_message", None) if message_obj else None
+        return {
+            "message_str": event.message_str,
+            "message_obj": message_obj,
+            "message_obj_message": copy.copy(getattr(message_obj, "message", None)) if message_obj else None,
+            "message_obj_message_str": getattr(message_obj, "message_str", None) if message_obj else None,
+            "sender": sender,
+            "sender_state": copy.copy(getattr(sender, "__dict__", {})) if sender else None,
+            "raw_message": raw_message,
+            "raw_message_state": copy.deepcopy(raw_message) if isinstance(raw_message, dict) else None,
+            "is_wake": getattr(event, "is_wake", None),
+            "is_at_or_wake_command": getattr(event, "is_at_or_wake_command", None),
+            "role": getattr(event, "role", None),
+        }
+
+    def _restore_event_state(self, event: AstrMessageEvent, state: Dict[str, Any]) -> None:
+        event.message_str = state["message_str"]
+        event.message_obj = state["message_obj"]
+        message_obj = state["message_obj"]
+        if message_obj is not None:
+            if state["message_obj_message"] is not None:
+                message_obj.message = state["message_obj_message"]
+            if state["message_obj_message_str"] is not None:
+                message_obj.message_str = state["message_obj_message_str"]
+        sender = state["sender"]
+        sender_state = state["sender_state"]
+        if sender is not None and sender_state is not None:
+            sender.__dict__.clear()
+            sender.__dict__.update(sender_state)
+        raw_message = state["raw_message"]
+        raw_message_state = state["raw_message_state"]
+        if isinstance(raw_message, dict) and raw_message_state is not None:
+            raw_message.clear()
+            raw_message.update(raw_message_state)
+        if state["is_wake"] is not None:
+            event.is_wake = state["is_wake"]
+        if state["is_at_or_wake_command"] is not None:
+            event.is_at_or_wake_command = state["is_at_or_wake_command"]
+        if state["role"] is not None:
+            event.role = state["role"]
+        if hasattr(event, "_extras"):
+            event._extras.pop("parsed_params", None)
+
+    def _apply_bot_identity(self, event: AstrMessageEvent) -> None:
+        if self._is_bot_framework_admin():
+            event.role = "admin"
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None) if message_obj else None
+        if sender is not None:
+            for attr in ("user_id", "id", "uin", "qq"):
+                if hasattr(sender, attr):
+                    try:
+                        setattr(sender, attr, self.bot_user_id)
+                    except Exception:
+                        pass
+        raw_message = getattr(message_obj, "raw_message", None) if message_obj else None
+        if isinstance(raw_message, dict):
+            raw_message["user_id"] = self.bot_user_id
+            if isinstance(raw_message.get("sender"), dict):
+                raw_message["sender"]["user_id"] = self.bot_user_id
+
+    def _validate_handler_filters(self, handler: StarHandlerMetadata, event: AstrMessageEvent) -> tuple[bool, str, Dict[str, Any]]:
+        cfg = self._get_astrbot_config()
+        original_message_str = event.message_str
+        event.message_str = original_message_str.lstrip("/")
+        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_str"):
+            event.message_obj.message_str = event.message_str
+        event.is_wake = True
+        event.is_at_or_wake_command = True
+        if hasattr(event, "_extras"):
+            event._extras.pop("parsed_params", None)
+
+        try:
+            for filter_ in handler.event_filters:
+                try:
+                    if isinstance(filter_, PermissionTypeFilter):
+                        if filter_.filter(event, cfg):
+                            continue
+                        if filter_.permission_type == PermissionType.ADMIN and self._is_configured_admin(event):
+                            continue
+                        return False, f"指令 {handler.handler_name} 权限校验未通过", {}
+
+                    if not filter_.filter(event, cfg):
+                        return False, f"指令 {handler.handler_name} 的过滤器校验未通过", {}
+                except Exception as e:
+                    return False, f"指令参数或过滤器校验失败: {e}", {}
+
+            params = event.get_extra("parsed_params", {}) if hasattr(event, "get_extra") else {}
+            return True, "可以执行", params or {}
+        finally:
+            event.message_str = original_message_str
+            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_str"):
+                event.message_obj.message_str = original_message_str
+            if hasattr(event, "_extras"):
+                event._extras.pop("parsed_params", None)
 
     def _normalize_image_output(self, image_value: Any) -> str:
         """将图片输出归一化为可回传给上游的稳定地址格式"""
@@ -615,41 +729,49 @@ class LLMExecutorPlugin(Star):
 
     @filter.llm_tool(name="execute_command")
     async def execute_command(self, event: AstrMessageEvent, **kwargs) -> str:
-        """🎮 执行 指令
-        
-        当用户明确表达想要执行某个 功能 时，使用此工具来执行对应的指令。
-        建议先使用 search_command 工具查找确认指令存在后再执行。
-        
+        """🎮 执行 AstrBot 指令
+
+        当用户明确要求使用某个 AstrBot 功能时，使用此工具执行对应指令。
+        如果不确定指令是否存在，建议先使用 search_command 或 list_executable_commands 查询。
+
+        【普通非管理员指令】
+        - 普通指令可以按用户意图正常执行。
+        - 用户让你“帮我执行”时，默认使用 as_bot=false，表示代理用户执行。
+        - 用户明确让“你自己执行 / 你也执行 / 用你的身份执行”时，可以使用 as_bot=true。
+
+        【管理员权限指令】
+        - 管理员指令必须谨慎执行。
+        - 非管理员用户请求管理员指令时，只有在用户可信、目标明确、操作低风险，并且用户明确希望 Bot 自己处理时，才可以使用 as_bot=true。
+        - as_bot=true 会尝试以 Bot 自己身份执行；只有 Bot 的账号已被配置为 AstrBot 框架管理员时，管理员指令才可能通过权限校验。
+        - 高影响管理员指令默认禁止自动执行，即使用户关系很好也不要调用，例如：重启、关闭、停止、更新、重载、删除、清空、重置、权限变更、添加/删除管理员、群发、广播、@全体等。
+
         【使用场景】
-        - 用户说"帮我钓鱼" → execute_command(command="钓鱼")
+        - 用户说"帮我钓鱼" → execute_command(command="钓鱼", as_bot=false)
         - 用户说"你也去钓鱼吧" → execute_command(command="钓鱼", as_bot=true)
-        - 用户说"禁言张三60秒" → execute_command(command="禁言", args="60", at_qq_list=["123456789"])
-        - 用户说"设置群头像为这张图" → execute_command(command="设置群头像", reply_image_url="http://...")
-        
-        【身份模式】
-        - as_bot=false（默认）: 代理用户执行，使用用户的身份和账户
-        - as_bot=true: Bot自己执行，使用Bot自己的身份和账户（Bot也会有自己的游戏账户）
-        
+        - 用户说"禁言张三60秒"，且满足管理员指令执行条件 → execute_command(command="禁言", args="60", at_qq_list=["123456789"], as_bot=true)
+        - 用户说"帮我重启机器人" → 不要调用此工具，应该拒绝自动执行
+        - 用户说"设置群头像为这张图"，且满足管理员指令执行条件 → execute_command(command="设置群头像", reply_image_url="http://...", as_bot=true)
+
         【特殊参数支持】
-        - at_qq_list: 当指令需要@目标用户时使用（如禁言、踢人等）
+        - at_qq_list: 当指令需要@目标用户时使用（如禁言、踢人、转账等）
         - reply_image_url: 当指令需要引用图片时使用（如设置群头像、裁剪图片等）
-        
+
         【注意事项】
-        - 指令名不需要带前缀（如 / 或 ~）
-        - 如果指令需要参数，在 args 中传入
-        - 某些管理员指令可能无法执行
-        - LLM 可以通过其他工具获取群友的QQ号和昵称
-        - 使用 as_bot=true 时，Bot会以自己的身份参与游戏（如钓鱼、签到等）
-        
+        - 指令名不需要带前缀（如 / 或 ~）。
+        - 如果指令需要参数，在 args 中传入。
+        - 如果目标用户、时间、数量、图片等关键参数不明确，先追问，不要猜测执行。
+        - 不确定是否为高影响管理员指令时，不要执行。
+        - 工具执行后的 result/images 会返回给你，用于向用户总结结果。
+
         Args:
             command(string): 要执行的指令名（不含前缀），如 "钓鱼"、"签到"、"背包"
             args(string): 指令参数，多个参数用空格分隔。可以使用 @0, @1 等占位符指定 at_qq_list 中对应用户的位置（可选）。例如 "@0 100" 表示第一个@用户后跟100
             at_qq_list(array[string]): 需要@的QQ号字符串列表（可选），如 ["123456789", "987654321"]
             reply_image_url(string): 需要引用的图片URL（可选）
-            as_bot(boolean): 是否以Bot自己的身份执行指令（可选，默认false）。true=Bot自己执行，false=代理用户执行
-        
+            as_bot(boolean): 是否以Bot自己的身份执行（可选，默认false）。false=代理用户执行；true=Bot自己执行。普通指令可按用户意图使用；管理员指令只有在可信、明确、低风险且Bot是框架管理员时才可使用true
+
         Returns:
-            JSON 格式的执行结果，包含 success、command、result 或 error 字段
+            JSON 格式的执行结果，包含 success、command、result/images 或 error 字段
         """
         command = kwargs.get('command', '').strip()
         args = kwargs.get('args', '').strip()
@@ -683,7 +805,7 @@ class LLMExecutorPlugin(Star):
             self._build_handler_cache()
         
         # 1. 检查是否可以执行
-        can_exec, reason = self._can_execute(command, event)
+        can_exec, reason = self._can_execute(command, event, as_bot=as_bot)
         if not can_exec:
             logger.warning(f"指令执行被拒绝: {command} - {reason}")
             return json.dumps({
@@ -712,218 +834,169 @@ class LLMExecutorPlugin(Star):
             }, ensure_ascii=False)
         
         # 4. 执行处理器
-        original_msg = event.message_str
-        original_message_obj = getattr(event, 'message_obj', None)
-        original_event = None
-        
+        base_event = event
+        event_state = self._snapshot_event_state(base_event)
+        original_result = base_event.get_result() if hasattr(base_event, "get_result") else None
+        result_texts = []
+        result_images = []
+        results_to_send = []
+        handler: StarHandlerMetadata = handler_info['handler']
+        exec_event = base_event
+
         try:
-            handler: StarHandlerMetadata = handler_info['handler']
-            
-            # 尝试根据 handler 签名把 args 的第一个数字参数转成 int（例如禁言 60）
-            args = self._coerce_first_arg_by_annotation(handler.handler, args)
-            # 如果as_bot=true，使用包装器替换事件对象
-            if as_bot:
-                # 保存原始事件对象
-                original_event = event
-                original_sender_id = event.get_sender_id()
-                
-                # 创建包装器，覆盖 get_sender_id() 方法
-                event = BotIdentityEventWrapper(event, self.bot_user_id)
-                logger.debug(f"已创建Bot身份包装器，原始ID: {original_sender_id}, Bot ID: {self.bot_user_id}")
-            
-            # 修改 event.message_str 以包含指令和参数
-            # 注意：部分下游插件直接解析 message_str（而不是 message_obj），
-            # 因此当存在 @ 参数时，也需要把 @ 信息同步到 message_str 中。
             if at_qq_list:
                 rendered_args = args or ""
                 has_placeholders = any(f"@{i}" in rendered_args for i in range(len(at_qq_list)))
                 if has_placeholders:
                     for i, qq in enumerate(at_qq_list):
                         rendered_args = rendered_args.replace(f"@{i}", f"@{qq}")
-                    event.message_str = f"/{actual_command}" + (f" {rendered_args}" if rendered_args else "")
+                    base_event.message_str = f"/{actual_command}" + (f" {rendered_args}" if rendered_args else "")
                 else:
                     at_text = " ".join(f"@{qq}" for qq in at_qq_list)
                     at_position_mode = self._resolve_at_position_mode(actual_command)
                     if at_position_mode == "after_args":
-                        if args:
-                            event.message_str = f"/{actual_command} {args} {at_text}"
-                        else:
-                            event.message_str = f"/{actual_command} {at_text}"
+                        base_event.message_str = f"/{actual_command}" + (f" {args}" if args else "") + f" {at_text}"
                     else:
-                        if args:
-                            event.message_str = f"/{actual_command} {at_text} {args}"
-                        else:
-                            event.message_str = f"/{actual_command} {at_text}"
+                        base_event.message_str = f"/{actual_command} {at_text}" + (f" {args}" if args else "")
             else:
-                event.message_str = f"/{actual_command}" + (f" {args}" if args else "")
-            
-            # 如果有特殊参数，构建 message_obj
+                base_event.message_str = f"/{actual_command}" + (f" {args}" if args else "")
+
             if at_qq_list or reply_image_url:
-                try:
-                    # 构建消息组件
-                    components = self._build_message_components(
-                        actual_command,
-                        args,
-                        at_qq_list,
-                        reply_image_url
-                    )
-                    
-                    # 更新 message_obj 的 message 属性
-                    if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'message'):
-                        event.message_obj.message = components
-                        logger.debug(f"已构建特殊消息组件: At={len(at_qq_list) if at_qq_list else 0}, Image={bool(reply_image_url)}")
-                    else:
-                        logger.warning("无法修改 message_obj，可能不支持此操作")
-                except Exception as e:
-                    logger.error(f"构建消息组件失败: {e}")
-            
-            logger.debug(f"执行指令，消息设置为: {event.message_str}")
-            
-            # 执行并收集结果
-            result_texts = []
-            result_images = []
-            results_to_send = []  # 收集所有结果用于合并转发判断
-            
-            try:
-                # 调用处理器的 handler 方法
-                # handler.handler 已经是绑定方法，不需要传入 plugin_instance
-                pos_args, kw_args = self._build_handler_call(handler.handler, event, args)
-                async for result in handler.handler(*pos_args, **kw_args):
-                    if result is not None:
-                        results_to_send.append(result)
-                        # 收集内容用于返回给 LLM
-                        extracted = self._extract_content_from_result(result)
-                        result_texts.extend(extracted["texts"])
-                        result_images.extend(extracted["images"])
-            except TypeError as e:
-                # 某些处理器可能不是异步生成器
-                logger.debug(f"处理器调用方式调整: {e}")
-                result = await handler.handler(*pos_args, **kw_args)
-                if result is not None:
+                components = self._build_message_components(actual_command, args, at_qq_list, reply_image_url)
+                if hasattr(base_event, 'message_obj') and hasattr(base_event.message_obj, 'message'):
+                    base_event.message_obj.message = components
+                    base_event.message_obj.message_str = base_event.message_str
+                    logger.debug(f"已构建特殊消息组件: At={len(at_qq_list) if at_qq_list else 0}, Image={bool(reply_image_url)}")
+                else:
+                    logger.warning("无法修改 message_obj，可能不支持此操作")
+            elif hasattr(base_event, 'message_obj') and hasattr(base_event.message_obj, 'message_str'):
+                base_event.message_obj.message_str = base_event.message_str
+
+            if as_bot:
+                original_sender_id = base_event.get_sender_id()
+                self._apply_bot_identity(base_event)
+                exec_event = BotIdentityEventWrapper(base_event, self.bot_user_id)
+                logger.debug(f"已应用Bot身份，原始ID: {original_sender_id}, Bot ID: {self.bot_user_id}")
+
+            logger.debug(f"执行指令，消息设置为: {base_event.message_str}")
+
+            filters_ok, filter_reason, parsed_params = self._validate_handler_filters(handler, exec_event)
+            if not filters_ok:
+                logger.warning(f"指令执行被过滤器拒绝: {command} - {filter_reason}")
+                return json.dumps({
+                    "success": False,
+                    "command": actual_command,
+                    "error": filter_reason
+                }, ensure_ascii=False)
+
+            async for result in call_handler(exec_event, handler.handler, **parsed_params):
+                current_result = exec_event.get_result() if hasattr(exec_event, "get_result") else None
+                if current_result is not None:
+                    results_to_send.append(current_result)
+                    extracted = self._extract_content_from_result(current_result)
+                    result_texts.extend(extracted["texts"])
+                    result_images.extend(extracted["images"])
+                    exec_event.clear_result()
+                elif result is not None:
                     results_to_send.append(result)
-                    # 收集内容用于返回给 LLM
                     extracted = self._extract_content_from_result(result)
                     result_texts.extend(extracted["texts"])
                     result_images.extend(extracted["images"])
-            
-            # 判断是否需要使用合并转发
+
             total_text_length = sum(len(text) for text in result_texts)
             use_forward = (
                 self.enable_forward
                 and total_text_length > self.forward_threshold
-                and event.get_platform_name() == "aiocqhttp"  # 只对 QQ 平台启用
+                and exec_event.get_platform_name() == "aiocqhttp"
             )
-            
+
             if use_forward:
-                # 使用合并转发发送
                 logger.info(f"文本长度 {total_text_length} 超过阈值 {self.forward_threshold}，使用合并转发")
                 try:
-                    # 将所有结果合并到一个 Node 中
                     all_components = []
                     for result in results_to_send:
                         if hasattr(result, 'chain') and result.chain:
                             all_components.extend(result.chain)
-                    
                     if all_components:
                         node = Node(
-                            uin=event.get_self_id(),
+                            uin=exec_event.get_self_id(),
                             name="珈百璃",
                             content=all_components
                         )
-                        from astrbot.core.message.message_event_result import MessageEventResult
-                        forward_result = MessageEventResult()
-                        forward_result.chain = [node]
-                        await event.send(forward_result)
-                        logger.debug(f"已使用合并转发发送指令结果")
+                        await exec_event.send(exec_event.chain_result([node]))
+                        logger.debug("已使用合并转发发送指令结果")
                 except Exception as forward_err:
                     logger.error(f"合并转发失败，使用普通方式发送: {forward_err}")
-                    # 失败则回退到普通发送
                     for result in results_to_send:
                         try:
-                            await event.send(result)
+                            await exec_event.send(result)
                         except Exception as send_err:
                             logger.warning(f"发送结果失败: {send_err}")
             else:
-                # 普通发送
                 for result in results_to_send:
                     try:
-                        await event.send(result)
-                        logger.debug(f"已发送指令结果给用户")
+                        await exec_event.send(result)
+                        logger.debug("已发送指令结果给用户")
                     except Exception as send_err:
                         logger.warning(f"发送结果失败: {send_err}")
-            
-            # 恢复原始消息和事件对象
-            if as_bot and original_event is not None:
-                # 如果使用了包装器，恢复原始事件对象
-                event = original_event
-                logger.debug(f"已恢复原始事件对象")
-            
-            event.message_str = original_msg
-            if original_message_obj is not None:
-                event.message_obj = original_message_obj
-            
-            # 构建返回结果
+
             response = {
                 "success": True,
                 "command": actual_command,
                 "args": args if args else None
             }
-            
-            # 添加文本结果
             if result_texts:
                 response["result"] = "\n".join(result_texts)
-            
-            # 添加图片URL（如果有）
             if result_images:
                 response["images"] = result_images
                 if not result_texts:
                     response["result"] = f"指令返回了 {len(result_images)} 张图片"
-            
-            # 如果什么都没有
             if not result_texts and not result_images:
                 response["result"] = "指令执行完成（无输出内容）"
-            
-            # 添加执行身份标识
-            if as_bot:
-                response["executed_as"] = "bot"
-            else:
-                response["executed_as"] = "user"
-            
+            response["executed_as"] = "bot" if as_bot else "user"
+
             logger.info(f"指令执行成功: {command} (身份: {'Bot' if as_bot else '用户'}), 文本: {len(result_texts)}, 图片: {len(result_images)}")
             return json.dumps(response, ensure_ascii=False)
-            
         except Exception as e:
             logger.error(f"执行指令 {command} 时发生错误: {e}", exc_info=True)
-            
-            # 尝试恢复原始消息和事件对象
-            try:
-                if as_bot and original_event is not None:
-                    event = original_event
-                event.message_str = original_msg
-            except Exception:
-                pass
-            
             return json.dumps({
                 "success": False,
                 "command": actual_command,
                 "error": f"执行失败: {str(e)}"
             }, ensure_ascii=False)
+        finally:
+            try:
+                self._restore_event_state(base_event, event_state)
+                if original_result is not None:
+                    base_event.set_result(original_result)
+                elif hasattr(base_event, "clear_result"):
+                    base_event.clear_result()
+            except Exception as restore_err:
+                logger.warning(f"恢复事件状态失败: {restore_err}")
 
     @filter.llm_tool(name="list_executable_commands")
     async def list_executable_commands(self, event: AstrMessageEvent, **kwargs) -> str:
         """📋 列出可执行的指令
-        
-        获取当前可以通过 execute_command 执行的所有指令列表。
-        
+
+        获取当前可以通过 execute_command 执行的指令列表。
+        当你不确定某个自然语言请求对应哪个指令，或不确定指令是否存在时，先使用此工具查询。
+
+        【使用原则】
+        - 此工具只负责列出当前用户身份下可见、可执行的指令。
+        - 普通非管理员指令可以按用户意图正常执行。
+        - 管理员权限指令可能不会出现在普通用户列表中；如果用户明确要求 Bot 自己处理管理员事务，execute_command(as_bot=true) 仍会根据 Bot 是否为框架管理员和安全规则再次校验。
+        - 即使某个高影响管理员指令出现在列表中，也不代表可以自动执行；重启、关闭、停止、更新、重载、删除、清空、重置、权限变更、群发、广播、@全体等仍默认禁止自动执行。
+
         【使用场景】
         - 用户问"你能帮我做什么" → 列出可执行的指令
         - 用户问"有哪些功能可以用" → 列出可执行的指令
-        
+        - 用户提出自然语言请求但你不知道指令名 → 先查询再选择合适指令
+
         Args:
             category(string): 按插件名筛选（可选）
-        
+
         Returns:
-            JSON 格式的可执行指令列表
+            JSON 格式的可执行指令列表，按插件分组
         """
         category = kwargs.get('category', '').strip()
         
